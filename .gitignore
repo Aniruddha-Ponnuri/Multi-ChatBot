@@ -42,3 +42,5 @@ documentation/
 
 # files
 *.bat
+**/data
+**/ruff_cache
