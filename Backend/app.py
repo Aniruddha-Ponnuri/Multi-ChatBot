@@ -1,5 +1,4 @@
 import os
-import threading
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -8,7 +7,6 @@ from dotenv import load_dotenv
 from config import DefaultConfig
 from utils.logger import CustomLogger
 from utils.database import FeedbackDatabase
-from utils.reward_model import RewardModel
 from utils.helpers import format_message_as_html, remove_html_tags
 from utils.stock_data import StockDataFetcher
 from services.llm_service import LLMService
@@ -44,30 +42,18 @@ CORS(app)
 logger.info("Flask app initialized with CORS enabled")
 
 # Initialize database
-db_path = os.path.join(os.path.dirname(__file__), config.get("database.path", "feedback.db"))
 db_folder = os.path.join(os.path.dirname(__file__), config.get("database.folder", "data"))
+os.makedirs(db_folder, exist_ok=True)
+db_filename = config.get("database.path", "feedback.db")
+db_path = os.path.join(db_folder, db_filename)
 logger.info(f"Initializing feedback database at: {db_path}")
-feedback_db = FeedbackDatabase(db_folder, db_path, logger)
+feedback_db = FeedbackDatabase(db_path, logger)
 logger.info("Feedback database initialized")
 
 # Initialize stock data fetcher
 logger.info("Initializing stock data fetcher")
 stock_fetcher = StockDataFetcher(logger)
 logger.info("Stock data fetcher initialized successfully")
-
-# Initialize reward model if RL is enabled
-reward_model = None
-if config.is_rl_enabled():
-    try:
-        logger.info("RL is enabled - initializing reward model")
-        reward_model = RewardModel(config, logger)
-        logger.info("Reward model initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize reward model: {e}")
-        logger.error(f"Error type: {type(e).__name__}")
-        logger.warning("Continuing without RL capabilities")
-else:
-    logger.info("RL is disabled - skipping reward model initialization")
 
 parsed_knowledge_base = ""  # This holds the parsed knowledge base content
 logger.info("Backend initialization complete")
@@ -326,285 +312,19 @@ def extract_stock_symbols(question):
         return [], False
 
 
-# Helper function to generate multiple candidate responses
-def generate_candidates(question, history, knowledge_base_prompt, n_candidates, stock_context=""):
-    """
-    Generate multiple candidate responses with varying parameters for RL selection
-
-    Args:
-        question: User's question
-        history: Conversation history string
-        knowledge_base_prompt: Knowledge base context
-        n_candidates: Number of candidates to generate
-        stock_context: Optional stock data context
-
-    Returns:
-        List of candidate response strings
-
-    Raises:
-        ValueError: If question is empty or n_candidates < 1
-    """
-    try:
-        # Input validation
-        if not question or not question.strip():
-            logger.error("generate_candidates called with empty question")
-            raise ValueError("Question cannot be empty")
-
-        if n_candidates < 1:
-            logger.error(f"generate_candidates called with invalid n_candidates: {n_candidates}")
-            raise ValueError("n_candidates must be at least 1")
-
-        logger.info("=" * 60)
-        logger.info(f"Starting candidate generation - requested: {n_candidates} candidates")
-        logger.info(f"Question length: {len(question)} chars, History length: {len(history)} chars")
-        logger.info(f"Knowledge base prompt length: {len(knowledge_base_prompt)} chars")
-        logger.info(
-            f"Stock context: {'present (' + str(len(stock_context)) + ' chars)' if stock_context else 'not present'}"
-        )
-
-        candidates = []
-        system_prompt = config.get_prompt("system_prompt")
-
-        if not system_prompt:
-            logger.warning("system_prompt not found in config, using empty system prompt")
-            system_prompt = ""
-
-        # Get temperature range for diversity
-        temp_min = config.get_rl_config("temperature_min", 0.7)
-        temp_max = config.get_rl_config("temperature_max", 1.2)
-        logger.info(f"Temperature range: {temp_min} to {temp_max}")
-
-        # Build the appropriate prompt with stock context if available
-        if stock_context:
-            logger.info("Building stock-specific prompt with real-time data")
-            prompt_template = config.get_prompt("stock_financial_prompt_template")
-            if not prompt_template:
-                # Fallback to regular financial prompt with stock context
-                logger.info("Stock prompt template not found, using fallback financial prompt")
-                prompt_template = config.get_prompt("financial_prompt_template")
-                if not prompt_template:
-                    logger.error("financial_prompt_template also not found in config")
-                    raise ValueError("Required prompt templates not found in configuration")
-                prompt = prompt_template.format(
-                    knowledge_base_prompt=f"{knowledge_base_prompt}\n\nREAL-TIME STOCK DATA:\n{stock_context}",
-                    history=history,
-                    question=question,
-                )
-            else:
-                prompt = prompt_template.format(
-                    stock_context=stock_context,
-                    knowledge_base_prompt=knowledge_base_prompt,
-                    history=history,
-                    question=question,
-                )
-        elif not history:
-            logger.info("No history present, using general question prompt")
-            prompt_template = config.get_prompt("general_question_prompt")
-            if not prompt_template:
-                logger.warning("general_question_prompt not found, using simple prompt")
-                prompt = question
-            else:
-                prompt = prompt_template.format(question=question)
-        else:
-            logger.info("Using financial prompt template with history")
-            prompt_template = config.get_prompt("financial_prompt_template")
-            if not prompt_template:
-                logger.error("financial_prompt_template not found in config")
-                raise ValueError("financial_prompt_template not found in configuration")
-            prompt = prompt_template.format(
-                knowledge_base_prompt=knowledge_base_prompt,
-                history=history,
-                question=question,
-            )
-
-        logger.info(f"Prompt built successfully, length: {len(prompt)} characters")
-        logger.info(f"Generating {n_candidates} candidate responses")
-
-        for i in range(n_candidates):
-            try:
-                # Vary temperature for diversity
-                temperature = temp_min + (temp_max - temp_min) * (i / max(1, n_candidates - 1))
-                logger.info(
-                    f"Generating candidate {i + 1}/{n_candidates} with temperature={temperature:.3f}"
-                )
-
-                answer = llm_service.generate(
-                    prompt=prompt,
-                    system_prompt=system_prompt,
-                    temperature=temperature,
-                )
-
-                if not answer or not answer.strip():
-                    logger.warning(f"Candidate {i + 1} returned empty response, skipping")
-                    continue
-
-                candidates.append(answer)
-                logger.info(
-                    f"Candidate {i + 1} generated successfully (length: {len(answer)} chars)"
-                )
-
-            except Exception as e:
-                logger.error(f"Error generating candidate {i + 1}/{n_candidates}: {e}")
-                logger.error(f"Error type: {type(e).__name__}")
-                logger.warning("Continuing with remaining candidates")
-                # Continue with other candidates even if one fails
-
-        logger.info(f"Successfully generated {len(candidates)}/{n_candidates} candidates")
-        logger.info("=" * 60)
-
-        if not candidates:
-            logger.error("Failed to generate any valid candidates")
-            raise RuntimeError("No candidates were successfully generated")
-
-        return candidates
-
-    except ValueError as ve:
-        logger.error("=" * 60)
-        logger.error(f"Validation error in generate_candidates: {ve}")
-        logger.error("=" * 60)
-        raise
-    except Exception as e:
-        logger.error("=" * 60)
-        logger.error(f"Critical error in generate_candidates: {e}")
-        logger.error(f"Error type: {type(e).__name__}")
-        logger.error("=" * 60)
-        raise
-
-
-def select_best_candidate(question, candidates):
-    """
-    Use reward model to select the best candidate response
-
-    Args:
-        question: Original user question
-        candidates: List of candidate responses
-
-    Returns:
-        Best candidate string or None if no valid candidates
-
-    Raises:
-        ValueError: If question is empty
-    """
-    try:
-        # Input validation
-        if not question or not question.strip():
-            logger.error("select_best_candidate called with empty question")
-            raise ValueError("Question cannot be empty")
-
-        logger.info("=" * 60)
-        logger.info(f"Selecting best candidate from {len(candidates)} options")
-        logger.info(f"Question: '{question[:100]}...'")
-
-        if not candidates:
-            logger.warning("No candidates provided for selection")
-            logger.info("=" * 60)
-            return None
-
-        if len(candidates) == 1:
-            logger.info("Only one candidate available, returning it")
-            logger.info("=" * 60)
-            return candidates[0]
-
-        if reward_model is None:
-            logger.warning("Reward model is None, selecting first candidate as fallback")
-            logger.info("=" * 60)
-            return candidates[0]
-
-        if not reward_model.is_ready():
-            logger.warning("Reward model not ready, selecting first candidate as fallback")
-            logger.info("=" * 60)
-            return candidates[0]
-
-        logger.info("Reward model is ready, proceeding with evaluation")
-        logger.info("Formatting candidates for reward model evaluation")
-
-        # Format texts for reward model
-        texts = [f"Q: {question}\nA: {candidate}" for candidate in candidates]
-        logger.info(f"Formatted {len(texts)} candidate texts for evaluation")
-
-        # Get scores from reward model
-        logger.info("Requesting scores from reward model")
-        scores = reward_model.predict_scores(texts)
-
-        if not scores or len(scores) != len(candidates):
-            logger.error(
-                f"Invalid scores returned: expected {len(candidates)}, got {len(scores) if scores else 0}"
-            )
-            logger.warning("Falling back to first candidate")
-            logger.info("=" * 60)
-            return candidates[0]
-
-        # Select candidate with highest score
-        best_idx = scores.index(max(scores))
-        best_candidate = candidates[best_idx]
-        best_score = scores[best_idx]
-
-        logger.info(
-            f"Selected candidate {best_idx + 1}/{len(candidates)} with score {best_score:.4f}"
-        )
-        logger.info(f"All candidate scores: {[f'{s:.4f}' for s in scores]}")
-        logger.info(
-            f"Score range: min={min(scores):.4f}, max={max(scores):.4f}, mean={sum(scores) / len(scores):.4f}"
-        )
-        logger.info(f"Best candidate length: {len(best_candidate)} chars")
-        logger.info("=" * 60)
-
-        return best_candidate
-
-    except ValueError as ve:
-        logger.error("=" * 60)
-        logger.error(f"Validation error in select_best_candidate: {ve}")
-        logger.error("=" * 60)
-        raise
-    except Exception as e:
-        logger.error("=" * 60)
-        logger.error(f"Error in candidate selection: {e}")
-        logger.error(f"Error type: {type(e).__name__}")
-        logger.warning("Falling back to first candidate due to error")
-        logger.error("=" * 60)
-        return candidates[0] if candidates else None
-
-    try:
-        logger.info("Formatting candidates for reward model evaluation")
-        # Format texts for reward model
-        texts = [f"Q: {question}\nA: {candidate}" for candidate in candidates]
-
-        # Get scores from reward model
-        logger.info("Requesting scores from reward model")
-        scores = reward_model.predict_scores(texts)
-
-        # Select candidate with highest score
-        best_idx = scores.index(max(scores))
-        best_candidate = candidates[best_idx]
-
-        logger.info(
-            f"Selected candidate {best_idx + 1}/{len(candidates)} with score {scores[best_idx]:.4f}"
-        )
-        logger.info(f"All candidate scores: {[f'{s:.4f}' for s in scores]}")
-        logger.info(f"Best candidate length: {len(best_candidate)} chars")
-
-        return best_candidate
-
-    except Exception as e:
-        logger.error(f"Error in candidate selection: {e}")
-        logger.warning("Falling back to first candidate due to error")
-        return candidates[0]
-
-
 # Endpoint to ask a question using the knowledge base
 @app.route("/ask", methods=["POST"])
 def ask_question():
     """
-    Main endpoint for question answering with optional RL and stock data
+    Main endpoint for question answering with stock data support
 
     Expected JSON:
         question (str): User's question
         history (str): Conversation history (optional)
-        use_rl (bool): Whether to use RL-based generation (optional)
         session_id (str): Session identifier (optional)
 
     Returns:
-        JSON with answer, history, RL info, and stock symbols
+        JSON with answer, history, and stock symbols
     """
     global parsed_knowledge_base
 
@@ -620,14 +340,12 @@ def ask_question():
 
         question = request.json.get("question")
         history = request.json.get("history", "")
-        use_rl = request.json.get("use_rl", config.is_rl_enabled())  # Allow override
         session_id = request.json.get("session_id")  # Get session ID if provided
 
         logger.info(
             f"Question received: '{question[:100] if question else 'None'}...' (length: {len(question) if question else 0})"
         )
         logger.info(f"History length: {len(history)} chars")
-        logger.info(f"RL mode: {'enabled' if use_rl else 'disabled'}")
         logger.info(f"Session ID: {session_id if session_id else 'None'}")
 
         # Validate question
@@ -695,73 +413,48 @@ def ask_question():
         else:
             logger.info(f"Not a stock query (is_stock_query={is_stock_query}, symbols={symbols})")
 
-        # Use RL-based generation if enabled and reward model is available
-        if use_rl and reward_model is not None:
-            logger.info("Using RL-based response generation")
-            n_candidates = config.get_rl_config("n_candidates", 4)
-            logger.info(f"Will generate {n_candidates} candidates for RL selection")
+        # Standard single response generation
+        logger.info("Using standard response generation")
+        system_prompt = config.get_prompt("system_prompt")
+        logger.info("Building prompt for response generation")
 
-            # Generate multiple candidates with stock context if available
-            candidates = generate_candidates(
-                question,
-                history,
-                knowledge_base_prompt,
-                n_candidates,
-                stock_context=stock_context,
-            )
-
-            if not candidates:
-                logger.error("Failed to generate any candidate responses")
-                return jsonify({"error": "Failed to generate any responses"}), 500
-
-            # Select best candidate using reward model
-            logger.info("Selecting best candidate from generated options")
-            answer = select_best_candidate(question, candidates)
-
-            logger.info("RL-based response generation completed successfully")
-        else:
-            # Standard single response generation
-            logger.info("Using standard (non-RL) response generation")
-            system_prompt = config.get_prompt("system_prompt")
-            logger.info("Building prompt for response generation")
-
-            # Build prompt - use stock-specific prompt if we have stock data
-            if stock_context:
-                logger.info("Building stock-specific prompt")
-                prompt_template = config.get_prompt("stock_financial_prompt_template")
-                if not prompt_template:
-                    # Fallback to regular financial prompt
-                    logger.info("Stock template not found, using fallback financial prompt")
-                    prompt_template = config.get_prompt("financial_prompt_template")
-                    prompt = prompt_template.format(
-                        knowledge_base_prompt=f"{knowledge_base_prompt}\n\nREAL-TIME STOCK DATA:\n{stock_context}",
-                        history=history,
-                        question=question,
-                    )
-                else:
-                    prompt = prompt_template.format(
-                        stock_context=stock_context,
-                        knowledge_base_prompt=knowledge_base_prompt,
-                        history=history,
-                        question=question,
-                    )
-            elif not history:
-                logger.info("Building general question prompt (no history)")
-                prompt_template = config.get_prompt("general_question_prompt")
-                prompt = prompt_template.format(question=question)
-            else:
-                logger.info("Building financial prompt with history")
+        # Build prompt - use stock-specific prompt if we have stock data
+        if stock_context:
+            logger.info("Building stock-specific prompt")
+            prompt_template = config.get_prompt("stock_financial_prompt_template")
+            if not prompt_template:
+                # Fallback to regular financial prompt
+                logger.info("Stock template not found, using fallback financial prompt")
                 prompt_template = config.get_prompt("financial_prompt_template")
                 prompt = prompt_template.format(
+                    knowledge_base_prompt=f"{knowledge_base_prompt}\n\nREAL-TIME STOCK DATA:\n{stock_context}",
+                    history=history,
+                    question=question,
+                )
+            else:
+                prompt = prompt_template.format(
+                    stock_context=stock_context,
                     knowledge_base_prompt=knowledge_base_prompt,
                     history=history,
                     question=question,
                 )
+        elif not history:
+            logger.info("Building general question prompt (no history)")
+            prompt_template = config.get_prompt("general_question_prompt")
+            prompt = prompt_template.format(question=question)
+        else:
+            logger.info("Building financial prompt with history")
+            prompt_template = config.get_prompt("financial_prompt_template")
+            prompt = prompt_template.format(
+                knowledge_base_prompt=knowledge_base_prompt,
+                history=history,
+                question=question,
+            )
 
-            logger.info("Calling LLM API for response generation")
-            answer = llm_service.generate(prompt=prompt, system_prompt=system_prompt)
+        logger.info("Calling LLM API for response generation")
+        answer = llm_service.generate(prompt=prompt, system_prompt=system_prompt)
 
-            logger.info(f"Standard response generated successfully (length: {len(answer)} chars)")
+        logger.info(f"Standard response generated successfully (length: {len(answer)} chars)")
 
         # Format the answer as HTML with line breaks and bullet points
         logger.info("Formatting answer as HTML")
@@ -819,7 +512,7 @@ def ask_question():
                     session_id,
                     "assistant",
                     formatted_answer,
-                    rl_used=(use_rl and reward_model is not None),
+                    rl_used=False,
                 )
                 logger.info(f"Messages saved to session {session_id}")
             except Exception as e:
@@ -835,7 +528,7 @@ def ask_question():
         response_data = {
             "answer": formatted_answer,
             "summarized_history": summarized_history,
-            "rl_used": use_rl and reward_model is not None,
+            "rl_used": False,
             "stock_symbols": symbols if is_stock_query and symbols else [],
         }
 
@@ -1004,13 +697,6 @@ def submit_feedback():
 
         logger.info(f"Feedback saved successfully with ID: {feedback_id}")
 
-        # Asynchronously update reward model if RL is enabled
-        if reward_model is not None and config.is_rl_enabled():
-            logger.info("RL enabled - triggering async reward model update")
-            threading.Thread(target=async_update_reward_model, daemon=True).start()
-        else:
-            logger.info("RL disabled or reward model unavailable - skipping model update")
-
         logger.info("Feedback submission completed successfully")
         logger.info("=" * 60)
 
@@ -1024,141 +710,6 @@ def submit_feedback():
 
     except Exception as e:
         logger.error(f"Error submitting feedback: {e}")
-        logger.error(f"Error type: {type(e).__name__}")
-        logger.error("=" * 60)
-        return jsonify({"error": str(e)}), 500
-
-
-def async_update_reward_model():
-    """Background task to update reward model with new feedback"""
-    try:
-        logger.info("Starting async reward model update")
-        min_samples = config.get_rl_config("reward_model.min_samples_for_training", 20)
-        logger.info(f"Minimum samples required for training: {min_samples}")
-
-        # Get training data from database
-        logger.info("Retrieving feedback data from database")
-        texts, labels = feedback_db.get_feedback_for_training(min_samples=0)
-
-        logger.info(f"Retrieved {len(texts)} training samples from database")
-
-        if len(texts) < min_samples:
-            logger.info(
-                f"Insufficient samples for training: {len(texts)}/{min_samples} - skipping update"
-            )
-            return
-
-        logger.info(
-            f"Sufficient samples available - updating reward model with {len(texts)} samples"
-        )
-        reward_model.update(texts, labels)
-        logger.info("Reward model update completed successfully")
-
-    except Exception as e:
-        logger.error(f"Error updating reward model: {e}")
-        logger.error(f"Error type: {type(e).__name__}")
-
-
-@app.route("/feedback/stats", methods=["GET"])
-def get_feedback_stats():
-    """Get statistics about feedback data"""
-    try:
-        logger.info("Received GET request to /feedback/stats endpoint")
-
-        logger.info("Retrieving feedback statistics from database")
-        stats = feedback_db.get_feedback_stats()
-        logger.info(f"Database stats: {stats}")
-
-        # Add reward model info if available
-        if reward_model is not None:
-            logger.info("Adding reward model statistics")
-            stats["reward_model_ready"] = reward_model.is_ready()
-            stats["reward_model_training_count"] = reward_model.get_training_count()
-            logger.info(
-                f"Reward model ready: {stats['reward_model_ready']}, training count: {stats['reward_model_training_count']}"
-            )
-        else:
-            logger.info("No reward model available")
-            stats["reward_model_ready"] = False
-            stats["reward_model_training_count"] = 0
-
-        stats["rl_enabled"] = config.is_rl_enabled()
-        logger.info(f"RL enabled: {stats['rl_enabled']}")
-
-        logger.info("Successfully compiled feedback statistics")
-        return jsonify(stats), 200
-
-    except Exception as e:
-        logger.error(f"Error getting feedback stats: {e}")
-        logger.error(f"Error type: {type(e).__name__}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/generate_candidates", methods=["POST"])
-def generate_candidates_endpoint():
-    """
-    Generate multiple candidate responses (for testing/debugging).
-    Expected JSON: {
-        "question": str,
-        "history": str (optional),
-        "n": int (optional, defaults to config value)
-    }
-    """
-    try:
-        logger.info("=" * 60)
-        logger.info("Received POST request to /generate_candidates endpoint")
-
-        data = request.json
-        question = data.get("question")
-        history = data.get("history", "")
-        n = data.get("n", config.get_rl_config("n_candidates", 4))
-
-        logger.info(f"Question: '{question[:100] if question else None}...'")
-        logger.info(f"History length: {len(history)} chars")
-        logger.info(f"Number of candidates requested: {n}")
-
-        if not question:
-            logger.error("Question parameter missing")
-            return jsonify({"error": "question is required"}), 400
-
-        # Check knowledge base
-        if parsed_knowledge_base:
-            knowledge_base_prompt = (
-                f"Here is some knowledge that can help:\n{parsed_knowledge_base}\n\n"
-            )
-            logger.info(f"Using knowledge base (length: {len(parsed_knowledge_base)} chars)")
-        else:
-            knowledge_base_prompt = ""
-            logger.info("No knowledge base available")
-
-        # Generate candidates
-        logger.info(f"Generating {n} candidates")
-        candidates = generate_candidates(question, history, knowledge_base_prompt, n)
-        logger.info(f"Successfully generated {len(candidates)} candidates")
-
-        # Get scores if reward model is available
-        scores = None
-        if reward_model is not None and reward_model.is_ready():
-            logger.info("Reward model available - calculating scores")
-            texts = [f"Q: {question}\nA: {c}" for c in candidates]
-            scores = reward_model.predict_scores(texts)
-            logger.info(f"Scores calculated: {scores}")
-        else:
-            logger.info("Reward model not available - no scores calculated")
-
-        logger.info("Successfully completed candidate generation")
-        logger.info("=" * 60)
-
-        return jsonify(
-            {
-                "candidates": candidates,
-                "scores": scores,
-                "count": len(candidates),
-            }
-        ), 200
-
-    except Exception as e:
-        logger.error(f"Error generating candidates: {e}")
         logger.error(f"Error type: {type(e).__name__}")
         logger.error("=" * 60)
         return jsonify({"error": str(e)}), 500
@@ -1239,18 +790,11 @@ def health_check():
     """Health check endpoint with system status"""
     logger.info("Received GET request to /health endpoint")
 
-    rl_enabled = config.is_rl_enabled()
-    reward_model_ready = reward_model.is_ready() if reward_model else False
-
-    logger.info(f"Health check - RL enabled: {rl_enabled}")
-    logger.info(f"Health check - Reward model ready: {reward_model_ready}")
     logger.info("Health check - Database connected: True")
 
     return jsonify(
         {
             "status": "healthy",
-            "rl_enabled": rl_enabled,
-            "reward_model_ready": reward_model_ready,
             "database_connected": True,
         }
     ), 200
@@ -1258,15 +802,7 @@ def health_check():
 
 if __name__ == "__main__":
     logger.info("=" * 80)
-    logger.info("Starting Financial Chatbot with RL capabilities")
-    logger.info(f"RL Mode: {'Enabled' if config.is_rl_enabled() else 'Disabled'}")
-    if reward_model:
-        training_count = reward_model.get_training_count()
-        logger.info(f"Reward model initialized and trained on {training_count} samples")
-        logger.info(f"Reward model ready: {reward_model.is_ready()}")
-    else:
-        logger.warning("Reward model not initialized - RL features unavailable")
-
+    logger.info("Starting Financial Chatbot")
     logger.info("Stock data fetcher initialized and ready")
     logger.info(f"Database path: {db_path}")
     logger.info(f"Flask app running in {'DEBUG' if True else 'PRODUCTION'} mode")

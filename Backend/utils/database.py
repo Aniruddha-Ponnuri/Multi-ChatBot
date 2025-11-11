@@ -12,9 +12,7 @@ class FeedbackDatabase:
     Also manages chat sessions and conversation history.
     """
 
-    def __init__(self, db_folder: str, db_path: str, logger: CustomLogger):
-        self.db_folder = db_folder
-        os.makedirs(self.db_folder, exist_ok=True)
+    def __init__(self, db_path: str, logger: CustomLogger):
         self.db_path = db_path
         self.logger = logger
         self._initialize_database()

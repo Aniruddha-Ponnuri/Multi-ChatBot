@@ -211,9 +211,9 @@ prompts:
     - Provide practical advice suitable for Indian retail investors
     - Mention both opportunities and risks transparently
 
-# Reinforcement Learning Configuration
+# Reinforcement Learning Configuration (Disabled)
 rl_config:
-  enabled: true
+  enabled: false
   n_candidates: 4  # Number of candidate responses to generate
   temperature_min: 0.1 # Minimum temperature for generation diversity
   temperature_max: 0.5  # Maximum temperature for generation diversity
